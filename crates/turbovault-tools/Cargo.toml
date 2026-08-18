@@ -47,6 +47,7 @@ regex = { workspace = true }
 
 # Tier 1d: Production-grade full-text search
 tantivy = { workspace = true }
+tantivy-jieba = { workspace = true }
 
 # Optional: SQL query engine for frontmatter queries
 turbovault-sql = { workspace = true, optional = true }
