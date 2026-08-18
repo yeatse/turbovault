@@ -90,6 +90,7 @@ gluesql = { version = "0.19", default-features = false, features = ["gluesql_mem
 
 # Search and Matching (Tier 1d: Replace hand-rolled implementations)
 tantivy = "0.26"           # Full-text search engine (Apache Lucene-inspired, production-grade)
+tantivy-jieba = "0.20"     # Chinese tokenizer adapter for Tantivy 0.26
 
 # File Editing & Diff (World-class fuzzy matching for LLM-generated edits)
 similar = { version = "3.1", features = ["inline"] }  # mitsuhiko's diff lib (used by insta)
