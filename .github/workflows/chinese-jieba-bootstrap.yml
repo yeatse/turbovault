@@ -1,0 +1,117 @@
+name: Bootstrap Chinese Jieba Search
+
+on:
+  push:
+    branches: [ feature/chinese-jieba-search ]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  implement-and-verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/chinese-jieba-search
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: chinese-jieba-bootstrap
+
+      - name: Apply Jieba search patch
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          root = Path('.')
+
+          cargo = root / 'Cargo.toml'
+          text = cargo.read_text()
+          old = 'tantivy = "0.26"           # Full-text search engine (Apache Lucene-inspired, production-grade)\n'
+          new = old + 'tantivy-jieba = "0.20"     # Chinese tokenizer adapter for Tantivy 0.26\n'
+          assert old in text and 'tantivy-jieba' not in text
+          cargo.write_text(text.replace(old, new, 1))
+
+          tools_cargo = root / 'crates/turbovault-tools/Cargo.toml'
+          text = tools_cargo.read_text()
+          old = 'tantivy = { workspace = true }\n'
+          new = old + 'tantivy-jieba = { workspace = true }\n'
+          assert old in text and 'tantivy-jieba' not in text
+          tools_cargo.write_text(text.replace(old, new, 1))
+
+          search = root / 'crates/turbovault-tools/src/search_engine.rs'
+          text = search.read_text()
+
+          old = 'use tantivy::schema::*;\nuse tantivy::{Index, ReloadPolicy, TantivyDocument, doc};\n'
+          new = (
+              'use tantivy::schema::*;\n'
+              'use tantivy::tokenizer::{LowerCaser, RemoveLongFilter, TextAnalyzer, Tokenizer};\n'
+              'use tantivy::{Index, ReloadPolicy, TantivyDocument, doc};\n'
+              'use tantivy_jieba::JiebaTokenizer;\n'
+          )
+          assert old in text
+          text = text.replace(old, new, 1)
+
+          marker = '/// Search engine for vault discovery (powered by tantivy)\n'
+          helper = '''const SEARCH_TOKENIZER: &str = "jieba";\n\nfn search_text_options(stored: bool) -> TextOptions {\n    let indexing = TextFieldIndexing::default()\n        .set_tokenizer(SEARCH_TOKENIZER)\n        .set_index_option(IndexRecordOption::WithFreqsAndPositions);\n    let options = TextOptions::default().set_indexing_options(indexing);\n    if stored {\n        options.set_stored()\n    } else {\n        options\n    }\n}\n\n'''
+          assert marker in text and 'const SEARCH_TOKENIZER' not in text
+          text = text.replace(marker, helper + marker, 1)
+
+          old = '''        schema_builder.add_text_field("path", STRING | STORED);\n        schema_builder.add_text_field("title", TEXT | STORED);\n        schema_builder.add_text_field("content", TEXT);\n        schema_builder.add_text_field("tags", TEXT | STORED);\n'''
+          new = '''        schema_builder.add_text_field("path", STRING | STORED);\n        schema_builder.add_text_field("title", search_text_options(true));\n        schema_builder.add_text_field("content", search_text_options(false));\n        schema_builder.add_text_field("tags", search_text_options(true));\n'''
+          assert old in text
+          text = text.replace(old, new, 1)
+
+          old = '        let index = Index::create_in_ram(schema.clone());\n\n        // Index all files\n'
+          new = '''        let index = Index::create_in_ram(schema.clone());\n        let jieba = TextAnalyzer::builder(JiebaTokenizer::new())\n            .filter(RemoveLongFilter::limit(40))\n            .filter(LowerCaser)\n            .build();\n        index.tokenizers().register(SEARCH_TOKENIZER, jieba);\n\n        // Index all files\n'''
+          assert old in text
+          text = text.replace(old, new, 1)
+
+          old = '''/// Extract keywords from content for recommendations\nfn extract_keywords(content: &str) -> Vec<String> {\n    content\n        .split_whitespace()\n        .filter(|word| word.len() > 3)\n        .filter(|word| !is_stopword(word))\n        .map(|w| w.to_lowercase())\n        .take(10)\n        .collect()\n}\n'''
+          new = '''/// Extract keywords from content for recommendations using the same tokenizer as search.\nfn extract_keywords(content: &str) -> Vec<String> {\n    let mut tokenizer = JiebaTokenizer::new();\n    let mut stream = tokenizer.token_stream(content);\n    let mut keywords = Vec::new();\n\n    while stream.advance() {\n        let term = stream.token().text.to_lowercase();\n        let is_cjk = term.chars().any(|ch| ('\\u{4e00}'..='\\u{9fff}').contains(&ch));\n        let long_enough = if is_cjk {\n            term.chars().count() >= 2\n        } else {\n            term.chars().count() > 3\n        };\n\n        if long_enough && !is_stopword(&term) && !keywords.contains(&term) {\n            keywords.push(term);\n        }\n        if keywords.len() >= 10 {\n            break;\n        }\n    }\n\n    keywords\n}\n'''
+          assert old in text
+          text = text.replace(old, new, 1)
+
+          marker = '    // ==================== INTEGRATION TESTS ====================\n'
+          tests = '''    #[test]\n    fn test_extract_keywords_supports_chinese() {\n        let keywords = extract_keywords("大语言模型正在改变个人知识库的知识检索方式");\n        assert!(keywords.iter().any(|term| term.contains("知识")));\n    }\n\n    #[tokio::test]\n    async fn chinese_content_search_uses_jieba_tokenizer() {\n        use tempfile::TempDir;\n        use turbovault_core::config::{ServerConfig, VaultConfig};\n\n        let tmp = TempDir::new().unwrap();\n        std::fs::write(\n            tmp.path().join("中文搜索.md"),\n            "# 中文搜索\\n\\n大语言模型正在改变个人知识库的知识处理方式。\\n",\n        )\n        .unwrap();\n\n        let mut cfg = ServerConfig::new();\n        cfg.vaults\n            .push(VaultConfig::builder("v", tmp.path()).build().unwrap());\n        let manager = Arc::new(VaultManager::new(cfg).unwrap());\n        let engine = SearchEngine::new(manager).await.unwrap();\n\n        let results = engine.search("知识处理").await.unwrap();\n        assert_eq!(results.len(), 1);\n        assert_eq!(results[0].path, "中文搜索.md");\n    }\n\n    #[tokio::test]\n    async fn mixed_chinese_english_search_keeps_lowercasing() {\n        use tempfile::TempDir;\n        use turbovault_core::config::{ServerConfig, VaultConfig};\n\n        let tmp = TempDir::new().unwrap();\n        std::fs::write(\n            tmp.path().join("RAG.md"),\n            "# RAG\\n\\n使用 RAG 改善知识检索。\\n",\n        )\n        .unwrap();\n\n        let mut cfg = ServerConfig::new();\n        cfg.vaults\n            .push(VaultConfig::builder("v", tmp.path()).build().unwrap());\n        let manager = Arc::new(VaultManager::new(cfg).unwrap());\n        let engine = SearchEngine::new(manager).await.unwrap();\n\n        let results = engine.search("rag").await.unwrap();\n        assert_eq!(results.len(), 1);\n        assert_eq!(results[0].path, "RAG.md");\n    }\n\n'''
+          assert marker in text
+          text = text.replace(marker, tests + marker, 1)
+
+          search.write_text(text)
+          PY
+
+      - name: Update lockfile
+        run: cargo check -p turbovault-tools
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Lint tools crate
+        run: cargo clippy -p turbovault-tools --all-features --all-targets -- -D warnings
+
+      - name: Run search-engine tests
+        run: cargo test -p turbovault-tools search_engine -- --nocapture
+
+      - name: Run full workspace tests
+        run: cargo test --workspace --all-features --all-targets
+
+      - name: Commit verified implementation
+        if: success()
+        run: |
+          rm .github/workflows/chinese-jieba-bootstrap.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Cargo.toml Cargo.lock crates/turbovault-tools/Cargo.toml crates/turbovault-tools/src/search_engine.rs .github/workflows/chinese-jieba-bootstrap.yml
+          git commit -m "feat(search): add Jieba tokenizer for Chinese vaults"
+          git push origin HEAD:feature/chinese-jieba-search
